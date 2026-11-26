@@ -20,11 +20,16 @@ class FakeApi:
         self.last = {}
         self.calls = []
         self.fail = False
+        self.breaks = []
 
     def symbols(self, trading_only, timeout=None):
         if self.fail:
             raise SpotApiError("boom")
         return list(self.rows)
+
+    def break_symbols(self, timeout=None):
+        self.calls.append(("break",))
+        return list(self.breaks)
 
     def first_bar_ms(self, symbol, start_ms=0):
         self.calls.append(("first", symbol, start_ms))
@@ -85,8 +90,8 @@ def test_delisting_after_two_misses_then_relisting(db):
     assert jobs.sample(S3) is True
     back = db.rows()[-1]
     assert (back["venue_symbol"], back["state"], back["event_time"]) == ("ABCUSDC", 1, dt(2026, 1, 1, 10, 10))
-    # looked for the first bar after the delisting, not the pair's first ever
-    assert api.calls[-1] == ("first", "ABCUSDC", to_ms(dt(2026, 1, 1, 10, 0)))
+    # looked for the first bar after the delisting row was written, not the pair's first ever
+    assert api.calls[-1] == ("first", "ABCUSDC", to_ms(S2))
 
 
 def test_bad_samples_write_nothing_and_keep_the_watermark(db):
@@ -138,3 +143,65 @@ def test_backfill_can_be_rebuilt_without_touching_live_rows(db):
         ("ABCUSDT", "ABCBTC", "backfill"), ("XYZUSDT", "XYZUSDT", "live")]
     assert db.duck_time() == S1
     assert db.read_last_states()["ABCUSDT"].state == 1
+
+
+def test_rebuild_after_live_keeps_the_live_timeline(db):
+    """Live saw ABC trading at its first sample and wrote nothing; a rebuild that ends ABC delisted
+    must not make the table say delisted from live_since on."""
+    from binance_listing.events import boundary_anchors
+
+    db.set_perps({"ABCUSDT": "ABC"})
+    db.replace_backfill([Event(dt(2020, 1, 1, 0, 2, 30), dt(2020, 1, 1), "spot", "ABCUSDT", "ABCUSDT", 1, "backfill")], None)
+    jobs, _ = make(db, FakeApi([row("ABCUSDT", "ABC", "USDT")]), S1)
+    assert jobs.sample(S1) is True and len(db.rows()) == 1   # agreed with the table: no live row
+
+    live_since = db.read_live_since()
+    observed = db.read_last_states(live_since)
+    assert observed["ABCUSDT"].source == "backfill"
+    rebuilt = [Event(dt(2020, 1, 1, 0, 2, 30), dt(2020, 1, 1), "spot", "ABCUSDT", "ABCUSDT", 1, "backfill"),
+               Event(dt(2021, 1, 1, 0, 7, 30), dt(2021, 1, 1), "spot", "ABCUSDT", "ABCUSDT", 2, "backfill")]
+    anchors = boundary_anchors(rebuilt, observed, live_since)
+    db.replace_backfill(rebuilt + anchors, None)
+
+    assert db.read_last_states()["ABCUSDT"].state == 1
+    assert db.read_last_states(dt(2025, 1, 1))["ABCUSDT"].state == 2
+    # a second rebuild from the same history adds the same anchor again, nothing more
+    observed = db.read_last_states(live_since)
+    db.replace_backfill(rebuilt + boundary_anchors(rebuilt, observed, live_since), None)
+    assert [r["state"] for r in db.rows()] == [1, 2, 1]
+
+
+def test_delisting_takes_the_pair_that_stopped_last(db):
+    """USDT was noted at listing but stopped a year earlier; BTC kept trading until today."""
+    db.set_perps({"1000ABCUSDT": "1000ABC"})
+    db.replace_backfill([Event(dt(2020, 1, 1, 0, 2, 30), dt(2020, 1, 1), "spot", "1000ABCUSDT", "ABCUSDT", 1, "backfill")], None)
+    api = FakeApi([row("ZZZUSDT", "ZZZ", "USDT")])
+    api.breaks = [row("ABCUSDT", "ABC", "USDT", "BREAK"), row("ABCBTC", "ABC", "BTC", "BREAK"),
+                  row("ZZZBTC", "ZZZ", "BTC", "BREAK")]
+    api.last = {"ABCUSDT": to_ms(dt(2025, 1, 1)), "ABCBTC": to_ms(dt(2026, 1, 1, 9, 59))}
+    jobs, clock = make(db, api, S1)
+    assert jobs.sample(S1) is True
+    assert ("break",) not in api.calls            # nothing delisted yet: no BREAK request
+    clock["now"] = S2
+    assert jobs.sample(S2) is True
+    gone = db.rows()[-1]
+    assert (gone["state"], gone["venue_symbol"], gone["event_time"]) == (2, "ABCBTC", dt(2026, 1, 1, 9, 59))
+    assert sorted(c for c in api.calls if c[0] == "last") == [("last", "ABCBTC"), ("last", "ABCUSDT")]
+
+
+def test_delisting_falls_back_to_the_noted_pair(db):
+    db.set_perps({"ABCUSDT": "ABC"})
+    db.replace_backfill([Event(dt(2020, 1, 1, 0, 2, 30), dt(2020, 1, 1), "spot", "ABCUSDT", "ABCUSDT", 1, "backfill")], None)
+    api = FakeApi([])
+    api.last["ABCUSDT"] = to_ms(dt(2026, 1, 1, 9, 59))
+
+    def boom(timeout=None):
+        raise SpotApiError("boom")
+
+    api.break_symbols = boom
+    jobs, clock = make(db, api, S1)
+    jobs.sample(S1)
+    clock["now"] = S2
+    assert jobs.sample(S2) is True
+    gone = db.rows()[-1]
+    assert (gone["state"], gone["venue_symbol"], gone["event_time"]) == (2, "ABCUSDT", dt(2026, 1, 1, 9, 59))

@@ -12,6 +12,8 @@ load_dotenv(_env_file, override=False)
 load_dotenv("/opt/duckport/server.env", override=False)
 
 SAMPLE_PERIOD_SECONDS = 300
+# A sample is written within this many seconds of its slot or dropped (known_at = the slot).
+WRITE_DEADLINE_SECONDS = 90
 
 
 def _derive_duckport_addr() -> str:
@@ -31,9 +33,13 @@ def parse_quotes(raw: str) -> frozenset[str]:
 
 
 def parse_offset(raw: str) -> int:
+    """Rows say "known at the slot" but are written up to WRITE_DEADLINE_SECONDS later. No 5-minute
+    bar may close in between, and the slot itself may not be a close: either way a backtest would
+    see the row at a close where live did not have it yet."""
     offset = int(raw)
-    if not 0 <= offset < SAMPLE_PERIOD_SECONDS:
-        raise ValueError(f"SAMPLE_OFFSET_SECONDS 必须在 0..{SAMPLE_PERIOD_SECONDS - 1} 之间")
+    upper = SAMPLE_PERIOD_SECONDS - WRITE_DEADLINE_SECONDS - 1
+    if not 1 <= offset <= upper:
+        raise ValueError(f"SAMPLE_OFFSET_SECONDS 必须在 1..{upper} 之间（写入最多晚 {WRITE_DEADLINE_SECONDS} 秒，不能跨过 5 分钟收盘）")
     return offset
 
 

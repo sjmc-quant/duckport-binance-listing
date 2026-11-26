@@ -62,7 +62,13 @@ class SpotApi:
 
     def symbols(self, trading_only: bool, timeout: Optional[float] = None) -> list[dict]:
         """[{symbol, base, quote, status}]. Weight 20. Without the filter, delisted pairs (BREAK) are included."""
-        params = {"symbolStatus": "TRADING"} if trading_only else None
+        return self._symbols({"symbolStatus": "TRADING"} if trading_only else None, timeout)
+
+    def break_symbols(self, timeout: Optional[float] = None) -> list[dict]:
+        """Pairs in BREAK (delisted or stopped), same rows as symbols(). Weight 20."""
+        return self._symbols({"symbolStatus": "BREAK"}, timeout)
+
+    def _symbols(self, params: Optional[dict], timeout: Optional[float]) -> list[dict]:
         payload = self._get("/api/v3/exchangeInfo", params, timeout)
         rows = payload.get("symbols") if isinstance(payload, dict) else None
         if not isinstance(rows, list):

@@ -37,5 +37,7 @@ def test_config_parsers():
     with pytest.raises(ValueError):
         parse_quotes("US-DT")
     assert parse_offset("150") == 150
-    with pytest.raises(ValueError):
-        parse_offset("300")
+    assert parse_offset("1") == 1 and parse_offset("209") == 209
+    for bad in ("0", "210", "299", "300"):
+        with pytest.raises(ValueError):
+            parse_offset(bad)
