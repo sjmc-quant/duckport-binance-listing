@@ -51,6 +51,7 @@ class LastState:
     state: int
     venue_symbol: str
     event_time: Optional[datetime]
+    source: str = ""
 
 
 @dataclass(frozen=True)
@@ -138,6 +139,47 @@ def history_events(
                             STATE_DELISTED, SOURCE_BACKFILL))
         floor = known
     return [event for event in events if event.known_at < before]
+
+
+def boundary_anchors(
+    events: Iterable[Event],
+    observed: Mapping[str, LastState],
+    live_since: datetime,
+) -> list[Event]:
+    """Rows at live_since that keep the live timeline as it was when the history under it is rebuilt.
+
+    events:   the rebuilt history, all before live_since
+    observed: perpetual symbol -> the table's last row at or before live_since, read before the rebuild
+
+    The first live sample wrote a row only where it disagreed with the table, so for every other
+    perpetual "what live saw" is the row the table had at live_since. If the rebuilt history ends
+    in another state, that state would show from live_since until live next writes for the
+    perpetual, and backtests would disagree with what live knew. An anchor restores the old state.
+
+    State 0 cannot be written: where the old table had no row but the rebuilt history ends in
+    trading, the anchor says delisted (2); 0 against 2 (neither has spot) is left alone.
+    """
+    final: dict[str, Event] = {}
+    for event in sorted(events, key=lambda e: e.known_at):
+        final[event.symbol] = event
+    anchors: list[Event] = []
+    for symbol in sorted(set(final) | set(observed)):
+        seen = observed.get(symbol)
+        if seen is not None and seen.source == SOURCE_LIVE:
+            continue    # a live row at live_since survives the rebuild and still decides
+        want = seen.state if seen is not None else STATE_NEVER
+        rebuilt = final.get(symbol)
+        have = rebuilt.state if rebuilt is not None else STATE_NEVER
+        if want == have:
+            continue
+        if want == STATE_NEVER:
+            if have != STATE_TRADING:
+                continue
+            want = STATE_DELISTED
+        venue = seen.venue_symbol if seen is not None else rebuilt.venue_symbol
+        event_time = seen.event_time if seen is not None else None
+        anchors.append(Event(live_since, event_time, MARKET_SPOT, symbol, venue, want, SOURCE_BACKFILL))
+    return anchors
 
 
 def plan_changes(

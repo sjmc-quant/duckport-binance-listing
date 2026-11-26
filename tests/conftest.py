@@ -60,10 +60,12 @@ class LocalDuckport(DuckportClient):
         return self.con.execute(sql).to_arrow_table().to_pylist()
 
     # test helpers
-    def set_perps(self, perps):
+    def set_perps(self, perps, tradfi=None):
         self.con.execute("DELETE FROM data.exginfo")
         for symbol, base in perps.items():
             self.con.execute("INSERT INTO data.exginfo VALUES ('usdt_perp', ?, ?, 'PERPETUAL')", [symbol, base])
+        for symbol, base in (tradfi or {}).items():
+            self.con.execute("INSERT INTO data.exginfo VALUES ('usdt_perp', ?, ?, 'TRADIFI_PERPETUAL')", [symbol, base])
 
     def rows(self):
         return self.query(

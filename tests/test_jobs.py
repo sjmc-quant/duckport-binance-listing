@@ -138,3 +138,29 @@ def test_backfill_can_be_rebuilt_without_touching_live_rows(db):
         ("ABCUSDT", "ABCBTC", "backfill"), ("XYZUSDT", "XYZUSDT", "live")]
     assert db.duck_time() == S1
     assert db.read_last_states()["ABCUSDT"].state == 1
+
+
+def test_rebuild_after_live_keeps_the_live_timeline(db):
+    """Live saw ABC trading at its first sample and wrote nothing; a rebuild that ends ABC delisted
+    must not make the table say delisted from live_since on."""
+    from binance_listing.events import boundary_anchors
+
+    db.set_perps({"ABCUSDT": "ABC"})
+    db.replace_backfill([Event(dt(2020, 1, 1, 0, 2, 30), dt(2020, 1, 1), "spot", "ABCUSDT", "ABCUSDT", 1, "backfill")], None)
+    jobs, _ = make(db, FakeApi([row("ABCUSDT", "ABC", "USDT")]), S1)
+    assert jobs.sample(S1) is True and len(db.rows()) == 1   # agreed with the table: no live row
+
+    live_since = db.read_live_since()
+    observed = db.read_last_states(live_since)
+    assert observed["ABCUSDT"].source == "backfill"
+    rebuilt = [Event(dt(2020, 1, 1, 0, 2, 30), dt(2020, 1, 1), "spot", "ABCUSDT", "ABCUSDT", 1, "backfill"),
+               Event(dt(2021, 1, 1, 0, 7, 30), dt(2021, 1, 1), "spot", "ABCUSDT", "ABCUSDT", 2, "backfill")]
+    anchors = boundary_anchors(rebuilt, observed, live_since)
+    db.replace_backfill(rebuilt + anchors, None)
+
+    assert db.read_last_states()["ABCUSDT"].state == 1
+    assert db.read_last_states(dt(2025, 1, 1))["ABCUSDT"].state == 2
+    # a second rebuild from the same history adds the same anchor again, nothing more
+    observed = db.read_last_states(live_since)
+    db.replace_backfill(rebuilt + boundary_anchors(rebuilt, observed, live_since), None)
+    assert [r["state"] for r in db.rows()] == [1, 2, 1]

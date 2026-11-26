@@ -25,6 +25,7 @@
 - 合约的币只要有一个现货交易对在交易就算（任意计价）。只认部分计价时设 `SPOT_QUOTES=USDT`，历史重建和实盘采样要用同一个值。
 - 合约和现货按名字对应：同名优先，其次去掉 `1000` / `1000000` / `1M` 前缀，另有少量别名（`LUNA2→LUNA`、`DODOX→DODO`、`RAYSOL→RAY`，在 `mapping.py`）。
 - 只按名字对应。名字被新币复用的合约（如 `LITUSDT`）会对到同名的旧现货，表里照实记录。
+- TradFi 合约（股票、商品等，`contract_type = TRADIFI_PERPETUAL`）没有现货币，实盘和历史重建都不写。历史重建按 `data.exginfo` 当前的 TradFi 名单排除，所以先当过 crypto 合约、后来名字给了股票的（如 `ANTUSDT`）也没有历史行。
 
 ## 实盘采样
 
@@ -59,6 +60,8 @@ sudo duckport start <实例>
 
 - 可以反复跑：每次把 `backfill` 行整批删掉重写，在一个事务里完成；`live` 行不动。
 - 只重建第一次实盘采样（记在 `data.config_dict` 的 `binance_listing:live_since`）之前的历史，之后的归实盘。
+- 实盘开始后再重建：实盘第一次采样只在和表里不同时写行，其余合约“实盘当时看到的”就是表在 `live_since` 那一刻的状态。重建的结果在这一刻和它不同的合约，会在 `live_since` 补一行（`source = backfill`）恢复原状态，`live_since` 之后的时间线保持不变。补行会打日志，`--dry-run` 也会列出来。
+- `data.exginfo` 里没有 USDT 永续时不重建（分不出 TradFi 合约）。
 - 约 2,900 个交易对、5,000 多次权重 2 的请求，经代理约 10 分钟；已用权重过 3000 会等到下一分钟。
 - 同一个交易对中途停牌又恢复的空档看不到（只查首末两根 K 线）。
 - 直接运行 `loadhist --dry-run` 只计算并打印，不写入。

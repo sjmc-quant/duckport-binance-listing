@@ -1,8 +1,10 @@
 from datetime import datetime as dt
 
 from binance_listing.events import (
+    Event,
     LastState,
     PairSpan,
+    boundary_anchors,
     history_events,
     merge_spans,
     next_sample_after,
@@ -118,3 +120,39 @@ def test_history_same_minute_ties_prefer_the_ranked_pair():
     ]
     events = history_events("ABCUSDT", spans, 150, dt(2026, 1, 1))
     assert [(e.state, e.venue_symbol) for e in events] == [(1, "ABCUSDT"), (2, "ABCUSDT")]
+
+
+LIVE_SINCE = dt(2026, 1, 1, 10, 2, 30)
+
+
+def backfill(symbol, known_at, state, venue=None):
+    return Event(known_at, known_at, "spot", symbol, venue or symbol, state, "backfill")
+
+
+def test_boundary_anchors_keep_what_live_saw():
+    rebuilt = [
+        backfill("AAAUSDT", dt(2020, 1, 1, 0, 2, 30), 1), backfill("AAAUSDT", dt(2021, 1, 1, 0, 7, 30), 2),
+        backfill("BBBUSDT", dt(2020, 1, 1, 0, 2, 30), 1),
+        backfill("CCCUSDT", dt(2020, 1, 1, 0, 2, 30), 1),
+        backfill("DDDUSDT", dt(2020, 1, 1, 0, 2, 30), 1), backfill("DDDUSDT", dt(2021, 1, 1, 0, 7, 30), 2),
+        backfill("EEEUSDT", dt(2020, 1, 1, 0, 2, 30), 1),
+    ]
+    observed = {
+        # old history said trading, the rebuilt one ends delisted: keep trading
+        "AAAUSDT": LastState(1, "AAABTC", dt(2019, 1, 1), "backfill"),
+        # same state: nothing to add
+        "BBBUSDT": LastState(1, "BBBUSDT", dt(2020, 1, 1), "backfill"),
+        # live wrote its own row at live_since: that row survives and decides
+        "CCCUSDT": LastState(2, "CCCUSDT", None, "live"),
+        # rebuilt history lost the coin, live saw it delisted: keep delisted
+        "FFFUSDT": LastState(2, "FFFUSDT", dt(2022, 1, 1), "backfill"),
+    }
+    # DDD: no old row, rebuilt ends delisted -> 0 vs 2, left alone
+    # EEE: no old row, rebuilt ends trading -> live saw no spot, anchor delisted
+    anchors = boundary_anchors(rebuilt, observed, LIVE_SINCE)
+    assert [(a.symbol, a.state, a.venue_symbol, a.event_time, a.known_at, a.source) for a in anchors] == [
+        ("AAAUSDT", 1, "AAABTC", dt(2019, 1, 1), LIVE_SINCE, "backfill"),
+        ("EEEUSDT", 2, "EEEUSDT", None, LIVE_SINCE, "backfill"),
+        ("FFFUSDT", 2, "FFFUSDT", dt(2022, 1, 1), LIVE_SINCE, "backfill"),
+    ]
+    assert boundary_anchors(rebuilt, {}, LIVE_SINCE)[0].symbol == "BBBUSDT"

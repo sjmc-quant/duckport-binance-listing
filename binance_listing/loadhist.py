@@ -38,6 +38,7 @@ from binance_listing.events import (  # noqa: E402
     STATE_TRADING,
     Event,
     PairSpan,
+    boundary_anchors,
     from_ms,
     history_events,
     sample_at_or_before,
@@ -76,12 +77,18 @@ def vision_perp_symbols(proxy: str = "") -> set[str]:
         marker = match.group(1)
 
 
-def collect_perps(vision: set[str], current: dict[str, str]) -> dict[str, str]:
-    """symbol -> base asset for every USDT perpetual, past and present."""
+def collect_perps(vision: set[str], current: dict[str, str], tradfi: frozenset[str] = frozenset()) -> dict[str, str]:
+    """symbol -> base asset for every USDT perpetual, past and present, except today's TradFi ones.
+
+    A TradFi contract (a stock, a commodity) has no spot coin, but its name can match an old,
+    unrelated spot coin (the stock BOTUSDT and the delisted coin BOT). Live never samples TradFi
+    contracts, so a state backfilled for one would stay forever. A name that was a crypto
+    perpetual before it became TradFi (ANTUSDT) loses its crypto-era history the same way.
+    """
     perps: dict[str, str] = {}
     for symbol in vision:
         base = perp_base_of(symbol)
-        if base:
+        if base and symbol not in tradfi:
             perps[symbol] = base
     perps.update(current)
     return perps
@@ -183,18 +190,33 @@ def main() -> None:
         logger.info("重建 %s 之前的历史（%s）", before,
                     "实盘第一次采样" if live_since else "还没有实盘采样，取当前采样点")
 
-        perps = collect_perps(vision_perp_symbols(PROXY_URL), client.read_perps())
+        current = client.read_perps()
+        if not current:
+            logger.error("exginfo 里没有 usdt_perp 合约（K 线采集插件没在跑？），分不出 TradFi 合约，不重建")
+            sys.exit(1)
+        tradfi = frozenset(client.read_tradfi_perps())
+        perps = collect_perps(vision_perp_symbols(PROXY_URL), current, tradfi)
+        # What live saw at its first sample, read before the rebuild replaces the rows under it
+        observed = client.read_last_states(live_since) if live_since else {}
         events, stats = build_events(SpotApi(proxy=PROXY_URL), perps, before)
+        # Live never samples TradFi contracts, so there is nothing of theirs to keep; their old rows just go
+        observed = {symbol: state for symbol, state in observed.items() if symbol not in tradfi}
+        anchors = boundary_anchors(events, observed, live_since) if live_since else []
+        if anchors:
+            logger.warning("重建后的历史在实盘开始时（%s）与实盘当时看到的不同，%s 个合约在该时刻补一行保持实盘不变: %s",
+                           live_since, len(anchors), " ".join(f"{a.symbol}={a.state}" for a in anchors))
         logger.info("合约 %(perps)s，对得上现货币 %(mapped)s，事件 %(events)s 行；"
                     "截止时有现货 %(trading_now)s，现货已下架 %(delisted_now)s", stats)
         logger.info("没有现货币的合约 %s 个: %s", len(stats["unmapped"]), " ".join(stats["unmapped"]))
         if dry_run:
             for event in sorted(events, key=lambda e: e.known_at)[-15:]:
                 print(event)
+            for anchor in anchors:
+                print("anchor", anchor)
             logger.info("dry-run：没有写入")
             return
-        client.replace_backfill(events, None if live_since else now_slot)
-        logger.info("已写入 %s 行 backfill", len(events))
+        client.replace_backfill(events + anchors, None if live_since else now_slot)
+        logger.info("已写入 %s 行 backfill（含实盘起点补行 %s）", len(events) + len(anchors), len(anchors))
     finally:
         client.close()
 

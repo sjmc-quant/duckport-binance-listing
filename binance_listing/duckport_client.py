@@ -46,6 +46,8 @@ DEDUP_KEY = ("market", "symbol", "known_at")
 STAGING = f"_staging_{TABLE_NAME}"
 LIVE_SINCE_KEY = f"{TABLE_NAME}:live_since"
 _TS = "%Y-%m-%d %H:%M:%S"
+# exginfo.contract_type of a TradFi perpetual (stock, commodity, FX): never a spot coin.
+TRADFI_CONTRACT = "TRADIFI_PERPETUAL"
 
 
 def events_to_arrow(events: list[Event]) -> pa.Table:
@@ -203,27 +205,39 @@ class DuckportClient:
 
     # ---- reads --------------------------------------------------------------
 
-    def read_perps(self) -> dict[str, str]:
-        """USDT perpetuals trading now (from the K-line ingestor's exginfo): symbol -> base asset."""
-        rows = self.query(
+    def _usdt_perp_rows(self) -> list[dict]:
+        return self.query(
             f"SELECT symbol, base_asset, contract_type FROM {self.schema}.exginfo "
             f"WHERE market = 'usdt_perp'"
         )
+
+    def read_perps(self) -> dict[str, str]:
+        """USDT perpetuals trading now (from the K-line ingestor's exginfo): symbol -> base asset."""
         return {
             row["symbol"]: row["base_asset"]
-            for row in rows
-            if row["symbol"] and row["base_asset"] and row["contract_type"] != "TRADIFI_PERPETUAL"
+            for row in self._usdt_perp_rows()
+            if row["symbol"] and row["base_asset"] and row["contract_type"] != TRADFI_CONTRACT
         }
 
-    def read_last_states(self) -> dict[str, LastState]:
+    def read_tradfi_perps(self) -> set[str]:
+        """USDT perpetuals trading now that are TradFi contracts (stocks, commodities): no spot coin."""
+        return {
+            row["symbol"]
+            for row in self._usdt_perp_rows()
+            if row["symbol"] and row["contract_type"] == TRADFI_CONTRACT
+        }
+
+    def read_last_states(self, at: Optional[datetime] = None) -> dict[str, LastState]:
+        """perpetual symbol -> its last row; with `at`, its last row with known_at <= at."""
+        upto = f" AND known_at <= TIMESTAMP '{at.strftime(_TS)}'" if at is not None else ""
         rows = self.query(
-            f"SELECT symbol, state, venue_symbol, event_time FROM ("
-            f"SELECT symbol, state, venue_symbol, event_time, "
+            f"SELECT symbol, state, venue_symbol, event_time, source FROM ("
+            f"SELECT symbol, state, venue_symbol, event_time, source, "
             f"row_number() OVER (PARTITION BY symbol ORDER BY known_at DESC) AS rn "
-            f"FROM {self.target} WHERE market = '{MARKET_SPOT}') WHERE rn = 1"
+            f"FROM {self.target} WHERE market = '{MARKET_SPOT}'{upto}) WHERE rn = 1"
         )
         return {
-            row["symbol"]: LastState(int(row["state"]), row["venue_symbol"], row["event_time"])
+            row["symbol"]: LastState(int(row["state"]), row["venue_symbol"], row["event_time"], row["source"])
             for row in rows
         }
 
