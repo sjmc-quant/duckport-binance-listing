@@ -7,7 +7,7 @@ import threading
 from datetime import datetime, timedelta
 from typing import Optional
 
-from binance_listing.config import PROXY_URL, SAMPLE_OFFSET_SECONDS, SPOT_QUOTES
+from binance_listing.config import PROXY_URL, SAMPLE_OFFSET_SECONDS, SPOT_QUOTES, WRITE_DEADLINE_SECONDS
 from binance_listing.duckport_client import DuckportClient
 from binance_listing.events import (
     MARKET_SPOT,
@@ -22,7 +22,7 @@ from binance_listing.events import (
     to_ms,
     utcnow,
 )
-from binance_listing.mapping import resolve_spot_base
+from binance_listing.mapping import quote_rank, resolve_spot_base
 from binance_listing.spot import RateLimited, SpotApi, SpotApiError, trading_by_base
 
 logger = logging.getLogger(__name__)
@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 # A row says "known at the sample time", so a sample must be written soon after it.
 # Bar lookups stop at LOOKUP_BUDGET; a sample not written by WRITE_DEADLINE is dropped.
 LOOKUP_BUDGET = timedelta(seconds=60)
-WRITE_DEADLINE = timedelta(seconds=90)
+WRITE_DEADLINE = timedelta(seconds=WRITE_DEADLINE_SECONDS)
 FETCH_RETRY_SECONDS = 5
 # If fewer than this share of the coins that had spot are still in the list, the list is
 # taken as bad (exchange maintenance, truncated response) and the sample is dropped.
@@ -80,21 +80,61 @@ class ListingJobs:
                 return None
 
     def _event_time(self, change: Change, slot: datetime) -> Optional[datetime]:
-        """First 1m bar of a listing, last 1m bar of a delisting; None if it cannot be had in time."""
+        """First 1m bar of a listing; None if it cannot be had in time."""
         if self._now() > slot + LOOKUP_BUDGET:
             return None
+        previous = change.previous
+        # After a delisting the coin was not trading at that row's known_at (live wrote the row
+        # because the sample missed it), so the relisting's first bar is at or after it. Not the
+        # pair's first bar ever, and still bounded when the delisting's event_time is NULL.
+        start = to_ms(previous.known_at) if previous and previous.known_at else 0
         try:
-            if change.state == STATE_DELISTED:
-                ms = self.api.last_bar_ms(change.venue_symbol)
-            else:
-                previous = change.previous
-                # After a delisting, the listing is the first bar after that, not the pair's first ever.
-                start = to_ms(previous.event_time) + 60_000 if previous and previous.event_time else 0
-                ms = self.api.first_bar_ms(change.venue_symbol, start)
+            ms = self.api.first_bar_ms(change.venue_symbol, start)
         except SpotApiError as exc:
             logger.warning("%s 查 1 分钟 K 线失败，event_time 留空: %s", change.venue_symbol, exc)
             return None
         return from_ms(ms) if ms is not None else None
+
+    def _stopped_pairs(self, slot: datetime) -> Optional[dict[str, list[tuple[str, str]]]]:
+        """base asset -> [(pair, quote)] of pairs in BREAK; None if the list cannot be had."""
+        if self._now() > slot + LOOKUP_BUDGET:
+            return None
+        try:
+            rows = self.api.break_symbols(timeout=min(20.0, (slot + LOOKUP_BUDGET - self._now()).total_seconds()))
+        except SpotApiError as exc:
+            logger.warning("现货 BREAK 名单拉取失败，下架只查原交易对: %s", exc)
+            return None
+        out: dict[str, list[tuple[str, str]]] = {}
+        for row in rows:
+            if self.quotes and row["quote"] not in self.quotes:
+                continue
+            out.setdefault(row["base"], []).append((row["symbol"], row["quote"]))
+        return out
+
+    def _delisting(self, change: Change, stopped: Optional[dict], slot: datetime) -> tuple[Optional[datetime], str]:
+        """(last 1m bar, pair) of the coin's pair that stopped last.
+
+        The pair noted at listing may have stopped long before the coin's last pair (USDT gone,
+        BTC still trading), so every stopped pair of the coin is looked at, as history does.
+        """
+        pairs = {change.venue_symbol: quote_rank("")}   # quote unknown here; the BREAK list may give it
+        base = resolve_spot_base(change.perp_base, stopped) if stopped and change.perp_base else None
+        for pair, quote in (stopped or {}).get(base, []):
+            pairs[pair] = quote_rank(quote)
+        best: Optional[tuple[int, int, str]] = None
+        for pair in sorted(pairs):
+            if self._now() > slot + LOOKUP_BUDGET:
+                break
+            try:
+                ms = self.api.last_bar_ms(pair)
+            except SpotApiError as exc:
+                logger.warning("%s 查最后一根 1 分钟 K 线失败: %s", pair, exc)
+                continue
+            if ms is not None and (best is None or (ms, -pairs[pair]) > (best[0], -best[1])):
+                best = (ms, pairs[pair], pair)
+        if best is None:
+            return None, change.venue_symbol
+        return from_ms(best[0]), best[2]
 
     def sample(self, slot: datetime) -> bool:
         """Run one sample for `slot`. Returns True if it was written (watermark moved)."""
@@ -117,11 +157,14 @@ class ListingJobs:
             return False
 
         changes, missing = plan_changes(perps, trading, last, self._missing, slot)
-        events = [
-            Event(slot, self._event_time(change, slot), MARKET_SPOT, change.symbol,
-                  change.venue_symbol, change.state, SOURCE_LIVE)
-            for change in changes
-        ]
+        stopped = self._stopped_pairs(slot) if any(c.state == STATE_DELISTED for c in changes) else None
+        events = []
+        for change in changes:
+            if change.state == STATE_DELISTED:
+                event_time, venue = self._delisting(change, stopped, slot)
+            else:
+                event_time, venue = self._event_time(change, slot), change.venue_symbol
+            events.append(Event(slot, event_time, MARKET_SPOT, change.symbol, venue, change.state, SOURCE_LIVE))
         if self._now() > slot + WRITE_DEADLINE:
             logger.warning("采样 %s 跳过：超过 %s 秒还没写完", slot, int(WRITE_DEADLINE.total_seconds()))
             return False

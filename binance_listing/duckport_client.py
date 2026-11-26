@@ -231,13 +231,14 @@ class DuckportClient:
         """perpetual symbol -> its last row; with `at`, its last row with known_at <= at."""
         upto = f" AND known_at <= TIMESTAMP '{at.strftime(_TS)}'" if at is not None else ""
         rows = self.query(
-            f"SELECT symbol, state, venue_symbol, event_time, source FROM ("
-            f"SELECT symbol, state, venue_symbol, event_time, source, "
+            f"SELECT symbol, state, venue_symbol, event_time, source, known_at FROM ("
+            f"SELECT symbol, state, venue_symbol, event_time, source, known_at, "
             f"row_number() OVER (PARTITION BY symbol ORDER BY known_at DESC) AS rn "
             f"FROM {self.target} WHERE market = '{MARKET_SPOT}'{upto}) WHERE rn = 1"
         )
         return {
-            row["symbol"]: LastState(int(row["state"]), row["venue_symbol"], row["event_time"], row["source"])
+            row["symbol"]: LastState(int(row["state"]), row["venue_symbol"], row["event_time"], row["source"],
+                                     row["known_at"])
             for row in rows
         }
 

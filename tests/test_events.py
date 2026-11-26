@@ -5,6 +5,7 @@ from binance_listing.events import (
     LastState,
     PairSpan,
     boundary_anchors,
+    delisting_known_at,
     history_events,
     merge_spans,
     next_sample_after,
@@ -59,13 +60,25 @@ def test_history_relisting_and_open_period():
 
 
 def test_history_short_gap_is_not_a_delisting():
+    # last bar 00:00 -> stops 00:01 -> first miss 00:02:30 -> delisting confirmed 00:07:30
+    assert delisting_known_at(dt(2021, 1, 1, 0, 0), 150) == dt(2021, 1, 1, 0, 7, 30)
     spans = [
         PairSpan("ABCBTC", dt(2020, 1, 1), dt(2021, 1, 1, 0, 0)),
-        PairSpan("ABCUSDT", dt(2021, 1, 1, 0, 8), None),
+        PairSpan("ABCUSDT", dt(2021, 1, 1, 0, 7), None),
     ]
-    assert len(merge_spans(spans)) == 1
-    spans[1] = PairSpan("ABCUSDT", dt(2021, 1, 1, 0, 30), None)
-    assert len(merge_spans(spans)) == 2
+    # trading again by the confirming sample: live writes no delisting
+    assert len(merge_spans(spans, 150)) == 1
+    # opens after it: live has already written the delisting, then a listing
+    spans[1] = PairSpan("ABCUSDT", dt(2021, 1, 1, 0, 8), None)
+    assert len(merge_spans(spans, 150)) == 2
+    events = history_events("ABCUSDT", spans, 150, dt(2026, 1, 1))
+    assert [(e.state, e.known_at) for e in events] == [
+        (1, dt(2020, 1, 1, 0, 2, 30)), (2, dt(2021, 1, 1, 0, 7, 30)), (1, dt(2021, 1, 1, 0, 12, 30))]
+    # the window follows the sampling grid, not a fixed number of minutes
+    spans = [PairSpan("ABCBTC", dt(2020, 1, 1), dt(2021, 1, 1, 0, 4)),
+             PairSpan("ABCUSDT", dt(2021, 1, 1, 0, 12), None)]
+    assert len(merge_spans(spans, 150)) == 1      # confirmed 00:12:30
+    assert len(merge_spans(spans, 30)) == 2       # confirmed 00:10:30
 
 
 def test_history_stops_before_cutoff_and_known_at_strictly_increases():
